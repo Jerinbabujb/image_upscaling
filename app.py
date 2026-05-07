@@ -1,79 +1,95 @@
 import sys
 import os
-import subprocess
+import types
 
-# --- 1. COMPATIBILITY PATCH ---
-# This fixes the 'functional_tensor' error in the Cloud environment
+# --- 1. CRITICAL COMPATIBILITY PATCH ---
+# Fixes 'ModuleNotFoundError: No module named torchvision.transforms.functional_tensor'
 try:
     import torchvision.transforms.functional_tensor
 except ImportError:
     try:
-        import torchvision.transforms.functional as F
-        sys.modules['torchvision.transforms.functional_tensor'] = F
+        from torchvision.transforms import functional as F
+        # Create a dummy module to satisfy older library imports
+        import types
+        sys.modules['torchvision.transforms.functional_tensor'] = types.ModuleType('functional_tensor')
+        sys.modules['torchvision.transforms.functional_tensor'].rgb_to_grayscale = F.rgb_to_grayscale
     except ImportError:
         pass
 
-import streamlit as st
+import torch
+import gradio as gr
+import cv2
+import numpy as np
 from PIL import Image
+from realesrgan import RealESRGANer
+from basicsr.archs.rrdbnet_arch import RRDBNet
 
-st.set_page_config(page_title="AI Image Upscaler", layout="centered")
-st.title("🚀 4x Image Upscaler")
+# --- 2. HARDWARE DETECTION ---
+# Railway uses CPU by default. This ensures the app doesn't crash looking for CUDA.
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"--- Deployment Mode: Running on {device} ---")
 
-# --- 2. AUTOMATIC SETUP ---
-# Clone the logic if it's missing from the Streamlit container
-if not os.path.exists("inference_realesrgan.py"):
-    with st.spinner("Initializing AI Engine..."):
-        subprocess.run(["git", "clone", "https://github.com/xinntao/Real-ESRGAN.git", "realsr_repo"])
-        # Move files to root so the app can find them
-        os.system("cp -r realsr_repo/* .")
-        os.system("rm -rf realsr_repo")
-
-# Ensure model weights are downloaded
-MODEL_PATH = "experiments/pretrained_models/RealESRGAN_x4plus.pth"
-if not os.path.exists(MODEL_PATH):
-    os.makedirs("experiments/pretrained_models", exist_ok=True)
-    subprocess.run(["wget", "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth", "-P", "experiments/pretrained_models/"])
-
-# --- 3. UI LOGIC ---
-uploaded_file = st.file_uploader("Upload an image (JPG/PNG)", type=["jpg", "jpeg", "png"])
-
-if uploaded_file is not None:
-    img = Image.open(uploaded_file)
-    st.image(img, caption="Original Image", use_container_width=True)
+# --- 3. MODEL INITIALIZATION ---
+def load_upscaler():
+    # Architecture settings for RealESRGAN_x4plus
+    model = RRDBNet(num_in_ch=3, num_out_ch=3, num_feat=64, num_block=23, num_grow_ch=32, scale=4)
     
-    if st.button("Upscale 4x"):
-        with st.spinner("Processing... 1-2 minutes on CPU."):
-            # Save upload
-            with open("temp_input.png", "wb") as f:
-                f.write(uploaded_file.getbuffer())
-            
-            # Create results folder
-            if not os.path.exists("results"):
-                os.makedirs("results")
+    model_path = os.path.join('experiments/pretrained_models', 'RealESRGAN_x4plus.pth')
+    
+    # Download weights if they don't exist in the Railway container
+    if not os.path.exists(model_path):
+        os.makedirs('experiments/pretrained_models', exist_ok=True)
+        print("Downloading weights...")
+        # Using -L to follow redirects from GitHub
+        os.system(f'curl -L https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth -o {model_path}')
 
-            # Run inference (added --tile to save memory)
-            cmd = [
-                "python", "inference_realesrgan.py",
-                "-n", "RealESRGAN_x4plus",
-                "-i", "temp_input.png",
-                "-o", "results",
-                "--outscale", "4",
-                "--tile", "400"
-            ]
-            subprocess.run(cmd)
-            
-            output_path = "results/temp_input_out.png"
-            
-            if os.path.exists(output_path):
-                st.success("Done!")
-                st.image(output_path, caption="Upscaled Image", use_container_width=True)
-                
-                with open(output_path, "rb") as file:
-                    st.download_button(
-                        label="Download High-Res Image",
-                        data=file,
-                        file_name="upscaled_image.png",
-                        mime="image/png"
-                    )
-            else:
-                st.error("Upscale failed. The server might have run out of memory.")
+    upsampler = RealESRGANer(
+        scale=4,
+        model_path=model_path,
+        model=model,
+        tile=200,         # Lowered to 200 for better CPU/RAM stability on Railway
+        tile_pad=10,
+        pre_pad=0,
+        half=False,       # Must be False for CPU deployment
+        device=device
+    )
+    return upsampler
+
+# Load the model into memory
+upsampler = load_upscaler()
+
+# --- 4. PREDICTION LOGIC ---
+def predict(image):
+    if image is None:
+        return None
+    
+    # Convert PIL Image to BGR for OpenCV
+    img = cv2.cvtColor(np.array(image), cv2.COLOR_RGB2BGR)
+    
+    try:
+        # outscale=4 matches our model
+        output, _ = upsampler.enhance(img, outscale=4)
+        
+        # Convert back to RGB for Gradio
+        res = cv2.cvtColor(output, cv2.COLOR_BGR2RGB)
+        return Image.fromarray(res)
+    except Exception as e:
+        print(f"Error: {e}")
+        return None
+
+# --- 5. GRADIO UI ---
+demo = gr.Interface(
+    fn=predict,
+    inputs=gr.Image(type="pil", label="Upload Photo"),
+    outputs=gr.Image(type="pil", label="4x Upscaled Result"),
+    title="🚀 AI Image Upscaler",
+    description="Powered by Real-ESRGAN. Processing takes 1-2 mins on CPU.",
+    flagging_mode="never"
+)
+
+# --- 6. RAILWAY PORT BINDING ---
+if __name__ == "__main__":
+    # Railway passes the port as an environment variable
+    server_port = int(os.environ.get("PORT", 7860))
+    # server_name="0.0.0.0" is required for the cloud proxy to find the app
+    demo.launch(server_name="0.0.0.0", server_port=server_port)
