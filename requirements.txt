@@ -1,9 +1,10 @@
-streamlit
-opencv-python-headless
+gradio
 torch
 torchvision
+opencv-python-headless
 numpy
 Pillow
 facexlib
 gfpgan
+realesrgan
 https://github.com/xinntao/BasicSR/archive/master.zip
