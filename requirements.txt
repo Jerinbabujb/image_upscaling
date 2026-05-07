@@ -2,8 +2,8 @@ streamlit
 opencv-python-headless
 torch
 torchvision
-basicsr
-facexlib
-gfpgan
 numpy
 Pillow
+facexlib
+gfpgan
+https://github.com/xinntao/BasicSR/archive/master.zip
